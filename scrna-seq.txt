@@ -1,0 +1,993 @@
+
+# ============================================================
+# Chicken ovary scRNA-seq preprocessing
+#QC -> DoubletFinder -> Harmony -> Resolution
+# ============================================================
+
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(DoubletFinder)
+library(dplyr)
+library(harmony)
+library(patchwork)
+library(clustree)
+library(future)
+
+
+# ============================================================
+# 1. Read SoupX-corrected matrices
+# ============================================================
+
+soupX_dir <- "01_soupX_filtered"
+
+sample_list <- list.dirs(
+  soupX_dir,
+  full.names = FALSE,
+  recursive = FALSE
+)
+
+time_list <- c(
+  "E_14", "E_14", "E_14",
+  "Week_1", "Week_1", "Week_1",
+  "Week_10", "Week_10", "Week_10",
+  "Week_15", "Week_15",
+  "Week_20", "Week_20", "Week_20",
+  "Week_30", "Week_30", "Week_30",
+  "Week_70", "Week_70", "Week_70",
+  "Week_90", "Week_90", "Week_90"
+)
+
+stopifnot(
+  length(sample_list) == length(time_list)
+)
+
+
+
+sample_info <- data.frame(
+  sample = sample_list,
+  time_info = time_list,
+  stringsAsFactors = FALSE
+)
+
+cat(
+  "\n========================================\n",
+  "Sample information\n",
+  "========================================\n"
+)
+
+print(sample_info)
+
+write.csv(
+  sample_info,
+  file = "sample_information.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 2. Create Seurat objects
+# ============================================================
+
+seob_list_soupX <- list()
+
+for (i in seq_along(sample_list)) {
+
+  sample <- sample_list[i]
+  time_point <- time_list[i]
+
+  message(
+    "Reading: ",
+    sample,
+    " (",
+    time_point,
+    ")"
+  )
+
+  data_path <- file.path(
+    soupX_dir,
+    sample
+  )
+
+  if (!dir.exists(data_path)) {
+    stop(
+      "Directory does not exist: ",
+      data_path
+    )
+  }
+
+  counts <- Read10X(
+    data.dir = data_path
+  )
+
+  seob <- CreateSeuratObject(
+    counts = counts,
+    project = sample,
+    min.cells = 3,
+    min.features = 200
+  )
+
+  seob$orig.ident <- sample
+  seob$time_info <- time_point
+
+  seob_list_soupX[[sample]] <- seob
+}
+
+
+# ============================================================
+# 3. Calculate mitochondrial and ribosomal percentages
+# ============================================================
+
+mito_genes <- c(
+  "ND1",
+  "ND2",
+  "ND3",
+  "ND4",
+  "ND4L",
+  "ND5",
+  "ND6",
+  "COX1",
+  "COX2",
+  "COX3",
+  "ATP8",
+  "ATP6",
+  "CYTB"
+)
+
+seob_list_soupX <- lapply(
+  seob_list_soupX,
+  function(obj) {
+
+    obj[["percent_mitochondrion"]] <-
+      PercentageFeatureSet(
+        obj,
+        features = mito_genes
+      )
+
+    obj[["percent_ribosome"]] <-
+      PercentageFeatureSet(
+        obj,
+        pattern = "^RP[SL]"
+      )
+
+    return(obj)
+  }
+)
+
+
+# ============================================================
+# 4. QC filtering
+# ============================================================
+
+filter_sample <- function(
+    obj,
+    min_features = 200,
+    max_features = 8000,
+    max_counts = 40000,
+    max_mt = 20
+) {
+
+  subset(
+    obj,
+    subset =
+      nFeature_RNA > min_features &
+      nFeature_RNA < max_features &
+      nCount_RNA < max_counts &
+      percent_mitochondrion < max_mt
+  )
+}
+
+seob_list_filtered <- lapply(
+  seob_list_soupX,
+  filter_sample
+)
+
+dir.create(
+  "singlets",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+saveRDS(
+  seob_list_filtered,
+  file = "singlets/seob_list_filtered.rds"
+)
+
+
+# ============================================================
+# 5. QC summary before DoubletFinder
+# ============================================================
+
+qc_before_doublet <- data.frame(
+  sample = names(seob_list_soupX),
+  Before_QC = sapply(
+    seob_list_soupX,
+    ncol
+  ),
+  After_QC = sapply(
+    seob_list_filtered,
+    ncol
+  )
+)
+
+qc_before_doublet$Removed_by_QC <-
+  qc_before_doublet$Before_QC -
+  qc_before_doublet$After_QC
+
+qc_before_doublet$QC_retention_rate <-
+  qc_before_doublet$After_QC /
+  qc_before_doublet$Before_QC *
+  100
+
+print(qc_before_doublet)
+
+write.csv(
+  qc_before_doublet,
+  file = "singlets/QC_before_DoubletFinder.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 6. QC violin plotting function
+# ============================================================
+
+plot_qc_violin_no_points <- function(
+    obj,
+    features,
+    output_file
+) {
+
+  p <- VlnPlot(
+    obj,
+    features = features,
+    assay = "RNA",
+    layer = "counts",
+    pt.size = 0,
+    raster = TRUE,
+    ncol = length(features),
+    combine = TRUE
+  ) +
+    NoLegend()
+
+  ggsave(
+    filename = output_file,
+    plot = p,
+    width = 22,
+    height = 6,
+    device = "pdf"
+  )
+}
+
+
+qc_features <- c(
+  "nFeature_RNA",
+  "nCount_RNA",
+  "percent_mitochondrion",
+  "percent_ribosome"
+)
+
+dir.create(
+  "QC_violin_plots",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+
+# ============================================================
+# 7. Add unique cell IDs
+# ============================================================
+
+# ------------------------------------------------------------
+# Filtered objects
+# ------------------------------------------------------------
+
+for (i in seq_along(seob_list_filtered)) {
+
+  sample_id <-
+    names(seob_list_filtered)[i]
+
+  seob_list_filtered[[i]] <-
+    RenameCells(
+      seob_list_filtered[[i]],
+      add.cell.id = sample_id
+    )
+}
+
+# ------------------------------------------------------------
+# SoupX objects
+# ------------------------------------------------------------
+
+for (i in seq_along(seob_list_soupX)) {
+
+  sample_id <-
+    names(seob_list_soupX)[i]
+
+  seob_list_soupX[[i]] <-
+    RenameCells(
+      seob_list_soupX[[i]],
+      add.cell.id = sample_id
+    )
+}
+
+
+# ============================================================
+# 8. QC violin plots before/after filtering
+# ============================================================
+
+merged_filtered <- merge(
+  seob_list_filtered[[1]],
+  y = seob_list_filtered[-1],
+  project = "MergedFiltered"
+)
+
+plot_qc_violin_no_points(
+  merged_filtered,
+  qc_features,
+  "QC_violin_plots/merged_filtered_QC_violin_no_points.pdf"
+)
+
+
+merged_soupX <- merge(
+  seob_list_soupX[[1]],
+  y = seob_list_soupX[-1],
+  project = "MergedSoupX"
+)
+
+plot_qc_violin_no_points(
+  merged_soupX,
+  qc_features,
+  "QC_violin_plots/merged_soupX_QC_violin_no_points.pdf"
+)
+
+
+rm(
+  merged_filtered,
+  merged_soupX
+)
+
+gc()
+
+
+# ============================================================
+# 9. DoubletFinder preprocessing
+# ============================================================
+
+set.seed(123)
+
+seob_list <- seob_list_filtered
+
+for (i in seq_along(seob_list)) {
+
+  sample_id <- names(seob_list)[i]
+
+  message(
+    "\n========================================\n",
+    "DoubletFinder preprocessing: ",
+    sample_id,
+    "\nCells: ",
+    ncol(seob_list[[i]]),
+    "\n========================================"
+  )
+
+  obj <- seob_list[[i]]
+
+  obj <- NormalizeData(
+    obj,
+    verbose = FALSE
+  )
+
+  obj <- FindVariableFeatures(
+    obj,
+    selection.method = "vst",
+    nfeatures = 2000,
+    verbose = FALSE
+  )
+
+  obj <- ScaleData(
+    obj,
+    verbose = FALSE
+  )
+
+  obj <- RunPCA(
+    obj,
+    verbose = FALSE
+  )
+
+  seob_list[[i]] <- obj
+}
+
+
+# ============================================================
+# 10. Run DoubletFinder separately for each sample
+# ============================================================
+
+for (i in seq_along(seob_list)) {
+
+  sample_id <- names(seob_list)[i]
+
+  s <- seob_list[[i]]
+
+  message(
+    "\n========================================\n",
+    "Running DoubletFinder: ",
+    sample_id,
+    "\nCells before DoubletFinder: ",
+    ncol(s),
+    "\n========================================"
+  )
+
+  # ----------------------------------------------------------
+  # Neighbor graph and clustering
+  # ----------------------------------------------------------
+
+  s <- FindNeighbors(
+    s,
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  s <- FindClusters(
+    s,
+    resolution = 0.4,
+    random.seed = 123,
+    verbose = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Expected doublet number
+  # ----------------------------------------------------------
+
+  nExp_poi <- round(
+    0.08 * ncol(s)
+  )
+
+
+  # ----------------------------------------------------------
+  # Homotypic doublet adjustment
+  # ----------------------------------------------------------
+
+  homotypic.prop <- modelHomotypic(
+    s$seurat_clusters
+  )
+
+  nExp_poi.adj <- round(
+    nExp_poi *
+      (1 - homotypic.prop)
+  )
+
+
+  # ----------------------------------------------------------
+  # Parameter sweep
+  # ----------------------------------------------------------
+
+  sweep.res.list <- paramSweep(
+    s,
+    PCs = 1:30,
+    sct = FALSE
+  )
+
+  sweep.stats <- summarizeSweep(
+    sweep.res.list,
+    GT = FALSE
+  )
+
+  bcmvn <- find.pK(
+    sweep.stats
+  )
+
+
+  # ----------------------------------------------------------
+  # Remove NA BCmetric
+  # ----------------------------------------------------------
+
+  bcmvn <- bcmvn[
+    !is.na(bcmvn$BCmetric),
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(bcmvn) == 0) {
+    stop(
+      "No valid pK value detected for sample: ",
+      sample_id
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # Optimal pK
+  # ----------------------------------------------------------
+
+  pK <- as.numeric(
+    as.character(
+      bcmvn$pK[
+        which.max(
+          bcmvn$BCmetric
+        )
+      ]
+    )
+  )
+
+  if (
+    length(pK) != 1 ||
+    is.na(pK)
+  ) {
+    stop(
+      "Invalid pK for sample: ",
+      sample_id
+    )
+  }
+
+
+  message(
+    "Sample: ",
+    sample_id,
+    "\nOptimal pK: ",
+    pK,
+    "\nExpected doublets before homotypic correction: ",
+    nExp_poi,
+    "\nExpected doublets after homotypic correction: ",
+    nExp_poi.adj
+  )
+
+
+  # ----------------------------------------------------------
+  # DoubletFinder
+  # ----------------------------------------------------------
+
+  s <- doubletFinder(
+    s,
+    PCs = 1:30,
+    pN = 0.25,
+    pK = pK,
+    nExp = nExp_poi.adj,
+    reuse.pANN = FALSE,
+    sct = FALSE
+  )
+
+  seob_list[[i]] <- s
+}
+
+
+# ============================================================
+# 11. Extract singlets
+# ============================================================
+
+seob_list_singlets <- lapply(
+  seob_list,
+  function(obj) {
+
+    df_col <- grep(
+      "^DF.classifications_",
+      colnames(obj@meta.data),
+      value = TRUE
+    )
+
+    if (length(df_col) != 1) {
+
+      stop(
+        "Expected exactly one DoubletFinder classification column, ",
+        "but found ",
+        length(df_col),
+        "."
+      )
+    }
+
+    singlet_cells <- colnames(obj)[
+      obj@meta.data[[df_col]] ==
+        "Singlet"
+    ]
+
+    subset(
+      obj,
+      cells = singlet_cells
+    )
+  }
+)
+
+stopifnot(
+  length(seob_list_singlets) ==
+    length(seob_list)
+)
+
+stopifnot(
+  all(
+    names(seob_list_singlets) ==
+      names(seob_list)
+  )
+)
+
+
+# ============================================================
+# 12. Save singlet objects
+# ============================================================
+
+saveRDS(
+  seob_list_singlets,
+  file =
+    "singlets/seob_list_singlets_filtered.rds"
+)
+
+
+# ============================================================
+# 13. QC summary after DoubletFinder
+# ============================================================
+
+qc_summary <- data.frame(
+  sample =
+    names(seob_list_soupX),
+
+  Before_QC =
+    sapply(
+      seob_list_soupX,
+      ncol
+    ),
+
+  After_QC =
+    sapply(
+      seob_list_filtered,
+      ncol
+    ),
+
+  After_DoubletFinder =
+    sapply(
+      seob_list_singlets,
+      ncol
+    )
+)
+
+qc_summary$Removed_by_QC <-
+  qc_summary$Before_QC -
+  qc_summary$After_QC
+
+qc_summary$Removed_doublets <-
+  qc_summary$After_QC -
+  qc_summary$After_DoubletFinder
+
+qc_summary$Doublet_rate_percent <-
+  qc_summary$Removed_doublets /
+  qc_summary$After_QC *
+  100
+
+qc_summary$Final_retention_rate_percent <-
+  qc_summary$After_DoubletFinder /
+  qc_summary$Before_QC *
+  100
+
+cat(
+  "\n========================================\n",
+  "QC summary\n",
+  "========================================\n"
+)
+
+print(qc_summary)
+
+write.csv(
+  qc_summary,
+  file =
+    "singlets/QC_cell_numbers_per_sample.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 14. Merge singlets for QC visualization
+# ============================================================
+
+merged_singlets <- merge(
+  seob_list_singlets[[1]],
+  y = seob_list_singlets[-1],
+  project = "MergedSinglets"
+)
+
+Idents(
+  merged_singlets
+) <- "orig.ident"
+
+plot_qc_violin_no_points(
+  merged_singlets,
+  qc_features,
+  "QC_violin_plots/merged_singlets_QC_violin_no_points.pdf"
+)
+
+rm(
+  merged_singlets
+)
+
+gc()
+
+
+# ============================================================
+# 15. Merge singlets for downstream analysis
+# ============================================================
+
+combined_obj <- merge(
+  seob_list_singlets[[1]],
+  y = seob_list_singlets[-1]
+)
+
+# Seurat v5 layers
+combined_obj <- JoinLayers(
+  combined_obj
+)
+
+DefaultAssay(
+  combined_obj
+) <- "RNA"
+
+
+# ============================================================
+# 16. Normalization and PCA
+# ============================================================
+
+combined_obj <- NormalizeData(
+  combined_obj,
+  normalization.method =
+    "LogNormalize",
+  scale.factor = 10000,
+  verbose = FALSE
+)
+
+combined_obj <- FindVariableFeatures(
+  combined_obj,
+  selection.method = "vst",
+  nfeatures = 3000,
+  verbose = FALSE
+)
+
+combined_obj <- ScaleData(
+  combined_obj,
+  features =
+    VariableFeatures(
+      combined_obj
+    ),
+  verbose = FALSE
+)
+
+combined_obj <- RunPCA(
+  combined_obj,
+  features =
+    VariableFeatures(
+      combined_obj
+    ),
+  verbose = FALSE
+)
+
+
+# ============================================================
+# 17. UMAP before Harmony
+# ============================================================
+
+combined_obj <- RunUMAP(
+  combined_obj,
+  reduction = "pca",
+  dims = 1:30,
+  reduction.name =
+    "umap_before_harmony",
+  verbose = FALSE
+)
+
+p1 <- DimPlot(
+  combined_obj,
+  group.by =
+    "orig.ident",
+  reduction =
+    "umap_before_harmony"
+) +
+  ggtitle(
+    "Before Harmony (by sample)"
+  )
+
+
+# ============================================================
+# 18. Harmony batch correction
+# ============================================================
+
+combined_obj <- RunHarmony(
+  combined_obj,
+  group.by.vars =
+    "orig.ident",
+  verbose = TRUE
+)
+
+
+# ============================================================
+# 19. UMAP after Harmony
+# ============================================================
+
+combined_obj <- RunUMAP(
+  combined_obj,
+  reduction =
+    "harmony",
+  dims = 1:30,
+  reduction.name =
+    "umap",
+  verbose = FALSE
+)
+
+combined_obj <- FindNeighbors(
+  combined_obj,
+  reduction =
+    "harmony",
+  dims = 1:30,
+  verbose = FALSE
+)
+
+p2 <- DimPlot(
+  combined_obj,
+  group.by =
+    "orig.ident",
+  reduction =
+    "umap"
+) +
+  ggtitle(
+    "After Harmony (by sample)"
+  )
+
+
+# ============================================================
+# 20. Before/after Harmony comparison
+# ============================================================
+
+plot_combined <-
+  p1 +
+  p2 +
+  plot_layout(
+    ncol = 2
+  )
+
+ggsave(
+  file.path(
+    "QC_violin_plots",
+    "UMAP_Harmony_Comparison.pdf"
+  ),
+  plot =
+    plot_combined,
+  width = 18,
+  height = 10
+)
+
+
+# ============================================================
+# 21. Save Harmony object
+# ============================================================
+
+saveRDS(
+  combined_obj,
+  file =
+    "singlets/seurat_combined_harmony.rds"
+)
+
+
+# ============================================================
+# 22. Resolution exploration
+# ============================================================
+
+dir.create(
+  "./02_explore_resolution",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+DefaultAssay(
+  combined_obj
+) <- "RNA"
+
+
+# ============================================================
+# 23. Elbow plot
+# ============================================================
+
+p_elbow <- ElbowPlot(
+  combined_obj,
+  ndims = 50,
+  reduction = "pca"
+)
+
+ggsave(
+  "./02_explore_resolution/PC.pdf",
+  plot = p_elbow,
+  width = 15,
+  height = 8
+)
+
+
+# ============================================================
+# 24. Recalculate Harmony neighbor graph
+# ============================================================
+
+combined_obj <- FindNeighbors(
+  combined_obj,
+  reduction =
+    "harmony",
+  dims = 1:30,
+  verbose = FALSE
+)
+
+
+# ============================================================
+# 25. Explore clustering resolutions
+# ============================================================
+
+future::plan(
+  "sequential"
+)
+
+resolutions <- seq(
+  from = 0,
+  to = 0.8,
+  by = 0.05
+)
+
+for (res in resolutions) {
+
+  message(
+    "Running FindClusters: resolution = ",
+    res
+  )
+
+  combined_obj <- FindClusters(
+    combined_obj,
+    resolution = res,
+    verbose = FALSE,
+    algorithm = 1,
+    random.seed = 123
+  )
+}
+
+
+# ============================================================
+# 26. Check generated metadata columns
+# ============================================================
+
+resolution_columns <- grep(
+  "^RNA_snn_res\\.",
+  colnames(
+    combined_obj@meta.data
+  ),
+  value = TRUE
+)
+
+cat(
+  "\n========================================\n",
+  "Resolution columns\n",
+  "========================================\n"
+)
+
+print(
+  resolution_columns
+)
+
+
+# ============================================================
+# 27. Clustree
+# ============================================================
+
+pdf(
+  "./02_explore_resolution/clustree_harmony_resolutions.pdf",
+  width = 25,
+  height = 20
+)
+
+print(
+  clustree(
+    combined_obj,
+    prefix =
+      "RNA_snn_res."
+  )
+)
+
+dev.off()
+
+
+# ============================================================
+# 28. Save final object containing all resolutions
+# ============================================================
+
+saveRDS(
+  combined_obj,
+  file =
+    "singlets/seurat_combined_harmony_with_resolutions.rds"
+)
